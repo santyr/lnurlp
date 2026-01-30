@@ -42,7 +42,11 @@ async def on_invoice_paid(payment: Payment):
 
     zap_receipt = None
     if pay_link.zaps:
-        zap_receipt = await send_zap(payment)
+        try:
+            zap_receipt = await send_zap(payment)
+        except Exception as exc:
+            logger.error(f"Failed to create/send zap receipt: {exc}")
+            # Continue to send webhook even if zap receipt fails
 
     await send_webhook(
         payment, pay_link, zap_receipt.to_message() if zap_receipt else None
@@ -111,24 +115,52 @@ async def mark_webhook_sent(
 async def send_zap(payment: Payment):
     nostr = payment.extra.get("nostr") if payment.extra else None
     if not nostr:
-        return
+        return None
 
-    event_json = json.loads(nostr)
+    # Parse the nostr zap request event
+    try:
+        event_json = json.loads(nostr)
+    except json.JSONDecodeError as exc:
+        logger.error(f"Failed to parse nostr zap request JSON: {exc}")
+        return None
 
-    def get_tag(event_json, tag):
-        res = [event_tag[1:] for event_tag in event_json["tags"] if event_tag[0] == tag]
-        return res[0] if res else None
+    # Validate basic event structure
+    if not isinstance(event_json, dict):
+        logger.error("Nostr zap request is not a valid JSON object")
+        return None
+
+    if "tags" not in event_json or not isinstance(event_json["tags"], list):
+        logger.error("Nostr zap request missing 'tags' array")
+        return None
+
+    def get_tag(event: dict, tag_name: str):
+        """Extract tag values from nostr event, returning None if not found."""
+        try:
+            res = [
+                event_tag[1:]
+                for event_tag in event["tags"]
+                if isinstance(event_tag, list)
+                and len(event_tag) >= 2
+                and event_tag[0] == tag_name
+            ]
+            return res[0] if res else None
+        except (KeyError, TypeError, IndexError) as exc:
+            logger.warning(f"Error extracting tag '{tag_name}': {exc}")
+            return None
 
     tags = []
     for t in ["p", "e", "a"]:
         tag = get_tag(event_json, t)
-        if tag:
+        if tag and len(tag) > 0:
             tags.append([t, tag[0]])
     tags.append(["bolt11", payment.bolt11])
     tags.append(["description", nostr])
 
     pubkey = next((pk[1] for pk in tags if pk[0] == "p"), None)
-    assert pubkey, "Cannot create zap receipt. Recepient pubkey is missing."
+    if not pubkey:
+        logger.error("Cannot create zap receipt: recipient pubkey ('p' tag) is missing")
+        return None
+
     zap_receipt = Event(
         kind=9735,
         tags=tags,
@@ -140,6 +172,10 @@ async def send_zap(payment: Payment):
 
     async def send_to_relay(relay_url: str, event_message: str):
         """Helper function to send an event to a single relay."""
+        # Validate relay URL format
+        if not isinstance(relay_url, str) or not relay_url.startswith(("ws://", "wss://")):
+            logger.warning(f"Invalid relay URL, skipping: {relay_url}")
+            return
         try:
             async with websockets.connect(relay_url, open_timeout=5) as websocket:
                 logger.debug(f"Sending zap to {relay_url}")
@@ -152,16 +188,21 @@ async def send_zap(payment: Payment):
     if not relays:
         return zap_receipt
 
-    if len(relays) > 50:
-        relays = relays[:50]
+    # Filter to valid relays only and limit count
+    valid_relays = [
+        r for r in relays
+        if isinstance(r, str) and r.startswith(("ws://", "wss://"))
+    ][:50]
 
-    # Create a list of tasks to run concurrently
+    if not valid_relays:
+        logger.warning("No valid relay URLs found in zap request")
+        return zap_receipt
 
     # Run all tasks concurrently. This is a "fire-and-forget" approach.
     # We don't need to wait for all of them to complete here.
     _ = [
         asyncio.create_task(send_to_relay(relay, zap_receipt.to_message()))
-        for relay in relays
+        for relay in valid_relays
     ]
 
     return zap_receipt
