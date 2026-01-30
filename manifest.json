@@ -2,8 +2,9 @@
   "repos": [
     {
       "id": "lnurlp",
-      "organisation": "lnbits",
-      "repository": "lnurlp"
+      "organisation": "santyr",
+      "repository": "lnurlp",
+      "branch": "v1.3.1-rc1"
     }
   ]
 }
