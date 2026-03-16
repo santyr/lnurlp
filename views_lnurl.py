@@ -70,8 +70,6 @@ async def api_lnurl_callback(
     amount: int | None = Query(None),
     webhook_data: str | None = Query(None),
 ) -> LnurlErrorResponse | LnurlPayActionResponse:
-    # Compatibility recovery for buggy clients that generate:
-    # ?webhook_data=... ?amount=...&nostr=...
     recovered_amount, recovered_nostr, cleaned_webhook_data = (
         _recover_broken_callback_params(webhook_data)
     )
@@ -102,7 +100,6 @@ async def api_lnurl_callback(
     if link.currency and link.fiat_base_multiplier:
         link.min = link.min / link.fiat_base_multiplier
         link.max = link.max / link.fiat_base_multiplier
-        # allow some fluctuation (as the fiat price may have changed between the calls)
         minimum = rate * 995 * link.min
         maximum = rate * 1010 * link.max
     else:
@@ -114,7 +111,7 @@ async def api_lnurl_callback(
             reason=f"Amount {amount} is smaller than minimum {minimum}."
         )
 
-    elif amount > maximum:
+    if amount > maximum:
         return LnurlErrorResponse(
             reason=f"Amount {amount} is greater than maximum {maximum}."
         )
@@ -140,10 +137,9 @@ async def api_lnurl_callback(
     if webhook_data:
         extra["webhook_data"] = webhook_data
 
-    # nip 57
     nostr = request.query_params.get("nostr") or recovered_nostr
     if nostr:
-        extra["nostr"] = nostr  # put it here for later publishing in tasks.py
+        extra["nostr"] = nostr
 
     if link.username:
         identifier = f"{link.username}@{link.domain or request.url.netloc}"
@@ -154,8 +150,6 @@ async def api_lnurl_callback(
         _metadata = [["text/plain", link.description]]
 
     metadata = LnurlPayMetadata(json.dumps(_metadata))
-
-    # we take the zap request as the description instead of the metadata if present
     unhashed_description = nostr.encode() if nostr else metadata.encode()
 
     payment = await create_invoice(
@@ -188,12 +182,12 @@ async def api_lnurl_callback(
 
 
 @lnurlp_lnurl_router.get(
-    "/api/v1/lnurl/{link_id}",  # Backwards compatibility for old LNURLs / QR codes
+    "/api/v1/lnurl/{link_id}",
     name="lnurlp.api_lnurl_response.deprecated",
     deprecated=True,
 )
 @lnurlp_lnurl_router.get(
-    "/{link_id}",
+    "{link_id}",
     name="lnurlp.api_lnurl_response",
 )
 async def api_lnurl_response(
@@ -244,7 +238,6 @@ async def api_lnurl_response(
     return res
 
 
-# redirected from /.well-known/lnurlp
 @lnurlp_lnurl_router.get("/api/v1/well-known/{username}")
 async def lnaddress(
     username: str, request: Request
