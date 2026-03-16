@@ -1,5 +1,6 @@
 import json
 from http import HTTPStatus
+from urllib.parse import parse_qs
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from lnbits.core.services import create_invoice
@@ -29,6 +30,35 @@ from .crud import (
 lnurlp_lnurl_router = APIRouter()
 
 
+def _recover_broken_callback_params(
+    webhook_data: str | None,
+) -> tuple[int | None, str | None, str | None]:
+    """
+    Compatibility shim for buggy clients that append callback params with '?'
+    even when the callback already contains a query string, e.g.:
+
+        .../cb/<id>?webhook_data=foo?amount=10000&nostr=...
+
+    Returns:
+        (amount, nostr, cleaned_webhook_data)
+    """
+    if not webhook_data or "?amount=" not in webhook_data:
+        return None, None, webhook_data
+
+    clean_webhook_data, broken_suffix = webhook_data.split("?", 1)
+    parsed = parse_qs(broken_suffix, keep_blank_values=True)
+
+    recovered_amount = parsed.get("amount", [None])[0]
+    recovered_nostr = parsed.get("nostr", [None])[0]
+
+    try:
+        recovered_amount_int = int(recovered_amount) if recovered_amount else None
+    except (TypeError, ValueError):
+        recovered_amount_int = None
+
+    return recovered_amount_int, recovered_nostr, clean_webhook_data
+
+
 @lnurlp_lnurl_router.get(
     "/api/v1/lnurl/cb/{link_id}",
     status_code=HTTPStatus.OK,
@@ -37,9 +67,27 @@ lnurlp_lnurl_router = APIRouter()
 async def api_lnurl_callback(
     request: Request,
     link_id: str,
-    amount: int = Query(...),
-    webhook_data: str = Query(None),
+    amount: int | None = Query(None),
+    webhook_data: str | None = Query(None),
 ) -> LnurlErrorResponse | LnurlPayActionResponse:
+    # Compatibility recovery for buggy clients that generate:
+    # ?webhook_data=... ?amount=...&nostr=...
+    recovered_amount, recovered_nostr, cleaned_webhook_data = (
+        _recover_broken_callback_params(webhook_data)
+    )
+
+    if amount is None and recovered_amount is not None:
+        amount = recovered_amount
+
+    if cleaned_webhook_data is not None:
+        webhook_data = cleaned_webhook_data
+
+    if amount is None:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="Missing required query parameter: amount",
+        )
+
     link = await get_pay_link(link_id)
     if not link:
         raise HTTPException(
@@ -61,7 +109,6 @@ async def api_lnurl_callback(
         minimum = link.min * 1000
         maximum = link.max * 1000
 
-    amount = amount
     if amount < minimum:
         return LnurlErrorResponse(
             reason=f"Amount {amount} is smaller than minimum {minimum}."
@@ -84,7 +131,7 @@ async def api_lnurl_callback(
     extra = {
         "tag": "lnurlp",
         "link": link.id,
-        "extra": request.query_params.get("amount"),
+        "extra": str(amount),
     }
 
     if comment:
@@ -94,7 +141,7 @@ async def api_lnurl_callback(
         extra["webhook_data"] = webhook_data
 
     # nip 57
-    nostr = request.query_params.get("nostr")
+    nostr = request.query_params.get("nostr") or recovered_nostr
     if nostr:
         extra["nostr"] = nostr  # put it here for later publishing in tasks.py
 
